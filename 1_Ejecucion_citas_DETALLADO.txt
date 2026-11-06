@@ -1,0 +1,229 @@
+
+--+++++++++   crear tabla temporal +++++++++++++++
+
+USE [SIGH]
+GO
+
+IF OBJECT_ID('dbo.TmpReporteEjecucionCitas', 'U') IS NOT NULL
+    DROP TABLE dbo.TmpReporteEjecucionCitas
+GO
+
+CREATE TABLE dbo.TmpReporteEjecucionCitas
+(
+    IdSesion           UNIQUEIDENTIFIER NOT NULL,
+    IdProgramacion     INT              NOT NULL,
+    IdCita             INT              NULL,
+    IdAtencion         INT              NULL,
+    IdCuentaAtencion   INT              NULL,
+
+    FechaCita          DATE             NOT NULL,
+    HoraCita           CHAR(5)          NOT NULL,
+    HoraFin            CHAR(5)          NULL,
+
+    IdServicio         INT              NULL,
+    Servicio           VARCHAR(200)     NULL,
+    IdEspecialidad     INT              NULL,
+    Especialidad       VARCHAR(200)     NULL,
+    IdMedicoProg       INT              NULL,
+    MedicoProg         VARCHAR(200)     NULL,
+
+    IdPaciente         INT              NULL,
+    Historia           VARCHAR(20)      NULL,
+    Paciente           VARCHAR(300)     NULL,
+
+    FechaAtencion      DATE             NULL,
+    HoraAtencion       CHAR(5)          NULL,
+    IdMedicoAtendio    INT              NULL,
+    MedicoAtendio      VARCHAR(200)     NULL,
+    UsuarioRegistro    VARCHAR(200)     NULL,
+    FechaRegistro      DATE             NULL,
+
+    EstadoCupo         VARCHAR(20)      NOT NULL,
+    EstadoAtencion     VARCHAR(20)      NULL,
+    Atendido           BIT              NOT NULL DEFAULT 0,
+
+    CONSTRAINT PK_TmpReporteEjecucionCitas
+        PRIMARY KEY (IdSesion, IdProgramacion, FechaCita, HoraCita)
+)
+GO
+
+CREATE INDEX IX_TmpRepCitas_Sesion
+    ON dbo.TmpReporteEjecucionCitas (IdSesion, Especialidad, MedicoProg)
+GO
+
+
+
+
+
+--++++++++++++++++  USP +++++++++++
+
+
+
+USE [SIGH]
+GO
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+ALTER PROCEDURE [dbo].[usp_select_ReporteEjecucionCitas_20261101]
+(
+    @FechaInicio DATE,
+    @FechaFin    DATE,
+    @IdServicio  INT = 0,
+    @IdSesion    UNIQUEIDENTIFIER OUTPUT
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET @IdSesion = NEWID();
+
+    DELETE FROM dbo.TmpReporteEjecucionCitas WHERE IdSesion = @IdSesion;
+
+    -- ============================================================
+    -- CTEs BASE
+    -- ============================================================
+    ;WITH Programaciones AS (
+        SELECT pr.IdProgramacion, pr.Fecha, pr.HoraInicio, pr.HoraFin,
+               pr.TiempoPromedioAtencion, pr.IdServicio, pr.IdEspecialidad, pr.IdMedico
+        FROM ProgramacionMedica pr
+        WHERE pr.Fecha >= @FechaInicio
+          AND pr.Fecha <  DATEADD(DAY, 1, @FechaFin)
+          AND (pr.IdServicio = @IdServicio OR @IdServicio = 0)
+          AND pr.TiempoPromedioAtencion > 0
+    ),
+    Slots AS (
+        SELECT p.IdProgramacion, p.Fecha, CAST(p.HoraInicio AS TIME) AS HoraSlot,
+               CAST(p.HoraFin AS TIME) AS HoraFin, p.TiempoPromedioAtencion,
+               p.IdServicio, p.IdEspecialidad, p.IdMedico
+        FROM Programaciones p
+        UNION ALL
+        SELECT s.IdProgramacion, s.Fecha, DATEADD(MINUTE, s.TiempoPromedioAtencion, s.HoraSlot),
+               s.HoraFin, s.TiempoPromedioAtencion, s.IdServicio, s.IdEspecialidad, s.IdMedico
+        FROM Slots s
+        WHERE DATEADD(MINUTE, s.TiempoPromedioAtencion, s.HoraSlot) < s.HoraFin
+    ),
+    SlotsUnicos AS (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY IdProgramacion, Fecha, HoraSlot ORDER BY IdProgramacion) AS rnSlot
+        FROM Slots
+    ),
+    -- ============================================================
+    -- LIMPIAMOS LAS CITAS (Aquí estaba el error)
+    -- Si hay dos citas para el mismo cupo, tomamos solo 1
+    -- ============================================================
+    CitasUnicas AS (
+        SELECT 
+            ci.IdCita, ci.IdProgramacion, ci.HoraInicio, ci.IdPaciente, ci.IdAtencion,
+            ROW_NUMBER() OVER (
+                PARTITION BY ci.IdProgramacion, ci.HoraInicio 
+                ORDER BY ci.IdCita DESC -- Tomamos la cita más reciente
+            ) AS rnCita
+        FROM Citas ci
+    ),
+    -- ============================================================
+    -- LIMPIAMOS LAS ATENCIONES
+    -- ============================================================
+    CitasAtenciones AS (
+        SELECT 
+            a.IdAtencion, a.IdCuentaAtencion, a.FechaIngreso, a.HoraIngreso, a.IdMedicoIngreso,
+            cu.FechaModificacion, cu.IdUsuarioCrea,
+            ROW_NUMBER() OVER (PARTITION BY a.IdAtencion ORDER BY a.IdAtencion DESC) AS rn
+        FROM Atenciones a
+        LEFT JOIN FacturacionCuentasAtencion cu 
+               ON a.IdCuentaAtencion = cu.IdCuentaAtencion AND cu.IdEstado <> 9
+        WHERE a.IdTipoServicio = 1
+    )
+    -- ============================================================
+    -- INSERT FINAL
+    -- ============================================================
+    INSERT INTO dbo.TmpReporteEjecucionCitas
+    (
+        IdSesion, IdProgramacion, IdCita, IdAtencion, IdCuentaAtencion,
+        FechaCita, HoraCita, HoraFin,
+        IdServicio, Servicio, IdEspecialidad, Especialidad,
+        IdMedicoProg, MedicoProg,
+        IdPaciente, Historia, Paciente,
+        FechaAtencion, HoraAtencion, IdMedicoAtendio, MedicoAtendio,
+        UsuarioRegistro, FechaRegistro,
+        EstadoCupo, EstadoAtencion, Atendido
+    )
+    SELECT
+        @IdSesion,
+        s.IdProgramacion,
+        ci.IdCita,
+        ca.IdAtencion,
+        ca.IdCuentaAtencion,
+        s.Fecha,
+        CONVERT(CHAR(5), s.HoraSlot, 108),
+        CONVERT(CHAR(5), DATEADD(MINUTE, s.TiempoPromedioAtencion, s.HoraSlot), 108),
+        s.IdServicio,
+        sv.Nombre,
+        s.IdEspecialidad,
+        es.Nombre,
+        s.IdMedico,
+        emeProg.ApellidoPaterno + ' ' + emeProg.ApellidoMaterno + ' ' + emeProg.Nombres,
+        p.IdPaciente,
+        RIGHT(ISNULL(CONVERT(VARCHAR(20),'000000' + p.NroHistoriaClinicaHEP),''),8),
+        LTRIM(RTRIM(ISNULL(p.ApellidoPaterno,'') + ' ' + ISNULL(p.ApellidoMaterno,'') + ' ' + ISNULL(p.PrimerNombre,''))),
+        ca.FechaIngreso,
+        ca.HoraIngreso,
+        meAt.IdMedico,
+        CASE WHEN emeAt.IdEmpleado IS NULL THEN NULL
+             ELSE emeAt.ApellidoPaterno + ' ' + emeAt.ApellidoMaterno + ' ' + emeAt.Nombres END,
+        CASE WHEN emReg.IdEmpleado IS NULL THEN NULL
+             ELSE emReg.ApellidoPaterno + ' ' + emReg.ApellidoMaterno + ' ' + emReg.Nombres END,
+        ca.FechaModificacion,
+        CASE
+            WHEN cb.IdCitaBloqueada IS NOT NULL THEN 'BLOQUEADO'
+            WHEN ci.IdCita IS NULL              THEN 'LIBRE'
+            ELSE 'OCUPADO'
+        END,
+        CASE
+            WHEN ci.IdCita IS NULL         THEN NULL
+            WHEN ca.IdAtencion IS NOT NULL THEN 'ATENDIDA'
+            ELSE 'NO ASISTIÓ'
+        END,
+        CASE WHEN ca.IdAtencion IS NOT NULL THEN 1 ELSE 0 END
+    FROM SlotsUnicos s 
+    INNER JOIN Servicios sv         ON s.IdServicio      = sv.IdServicio
+    INNER JOIN Especialidades es    ON s.IdEspecialidad  = es.IdEspecialidad
+    INNER JOIN Medicos meProg       ON s.IdMedico        = meProg.IdMedico
+    INNER JOIN Empleados emeProg    ON meProg.IdEmpleado  = emeProg.IdEmpleado
+    
+    -- USAMOS LA CITA LIMPIA Y SOLO LA FILA 1
+    LEFT  JOIN CitasUnicas ci       ON ci.IdProgramacion = s.IdProgramacion
+                                   AND ci.HoraInicio     = CONVERT(CHAR(5), s.HoraSlot, 108)
+                                   AND ci.rnCita         = 1
+    
+    LEFT  JOIN CitasAtenciones ca   ON ca.IdAtencion     = ci.IdAtencion 
+                                   AND ca.rn             = 1
+    LEFT  JOIN Pacientes p          ON ci.IdPaciente     = p.IdPaciente
+    LEFT  JOIN Medicos meAt         ON ca.IdMedicoIngreso = meAt.IdMedico
+    LEFT  JOIN Empleados emeAt      ON meAt.IdEmpleado   = emeAt.IdEmpleado
+    LEFT  JOIN Empleados emReg      ON ca.IdUsuarioCrea  = emReg.IdEmpleado
+    LEFT  JOIN CitasBloqueadas cb   ON cb.Fecha          = s.Fecha
+                                   AND cb.HoraInicio     = CONVERT(CHAR(5), s.HoraSlot, 108)
+                                   AND cb.IdMedico       = s.IdMedico
+                                   AND cb.IdTipoBloqueo  = 1
+    WHERE s.rnSlot = 1
+    OPTION (MAXRECURSION 0);
+
+    SELECT IdSesion = @IdSesion;
+END
+GO
+
+
+
+--++++++++++  ejecucion +++++++++++++++
+DECLARE @MiSesion UNIQUEIDENTIFIER;
+
+EXEC [dbo].[usp_select_ReporteEjecucionCitas_20261101]
+    @FechaInicio = '2026-10-01',
+    @FechaFin    = '2026-10-31',
+    @IdServicio  = 0,
+    @IdSesion    = @MiSesion OUTPUT;
+
+SELECT * 
+FROM dbo.TmpReporteEjecucionCitas
+WHERE IdSesion = @MiSesion
+ORDER BY Especialidad, MedicoProg, FechaCita, HoraCita;

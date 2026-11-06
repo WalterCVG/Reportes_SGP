@@ -1,0 +1,104 @@
+
+Paso 1: Crear la tabla con la estructura correcta
+Ejecuta este script en tu base de datos para crear una tabla diseñada específicamente para almacenar el resultado de tu reporte.
+================
+
+USE [SIGH]
+GO
+
+IF OBJECT_ID('dbo.TmpReporteCitas', 'U') IS NOT NULL
+    DROP TABLE dbo.TmpReporteCitas;
+GO
+
+CREATE TABLE dbo.TmpReporteCitas (
+    IdCita             INT NULL,
+    IdProgramacion     INT NULL,
+    IdCuentaAtencion   INT NULL,
+    Fecha              VARCHAR(10) NULL,
+    HoraInicio         VARCHAR(10) NULL,
+    HoraFin            VARCHAR(10) NULL,
+    Historia           VARCHAR(10) NULL,
+    Servicio           VARCHAR(100) NULL,
+    Especialidad       VARCHAR(100) NULL,
+    Medico             VARCHAR(200) NULL,
+    Paciente           VARCHAR(200) NULL,
+    Usuario            VARCHAR(200) NULL,
+    FechaRegistro      VARCHAR(10) NULL,
+    EstadoCupo         VARCHAR(20) NULL,
+    Comentario         VARCHAR(50) NULL,
+    EsBloqueado        INT NULL,
+    Celular            VARCHAR(50) NULL
+);
+GO
+
+
+********************
+
+Paso 2: Volcar los datos del USP a la tabla
+====================
+En lugar de hacer un SELECT complejo, SQL Server permite insertar directamente el resultado de un Procedimiento Almacenado en una tabla usando INSERT INTO ... EXEC.
+Puedes crear un pequeño USP o ejecutar esto directamente desde VB6:
+
+
+-- 1. Limpiar la tabla de reportes anteriores (Opcional, pero recomendado)
+TRUNCATE TABLE [dbo].[ReporteCitas_Temp];
+
+-- 2. Ejecutar el USP y guardar el resultado en la tabla
+INSERT INTO [dbo].[ReporteCitas_Temp]
+EXEC [dbo].[usp_select_ReporteCitas_20260918] 
+    @FechaInicio = 
+-09-18', 
+    @FechaFin    = '2026-09-18', 
+    @IdServicio  = 0;
+
+-- 3. Verificar que los datos se cargaron
+SELECT * FROM [dbo].[ReporteCitas_Temp];
+
+
+
+Paso 3: Lanzar la impresión desde VB6.0
+=================
+Una vez que los datos están en la tabla [dbo].[ReporteCitas_Temp], tienes dos formas principales de imprimirlos en VB6:
+
+Si usas Crystal Reports o generas el reporte manualmente con Printer.Print, cargas los datos así:
+
+
+Dim cn As ADODB.Connection
+Dim rs As ADODB.Recordset
+Dim cmd As ADODB.Command
+
+Set cn = New ADODB.Connection
+cn.ConnectionString = "Tu_Cadena_De_Conexion"
+cn.Open
+
+' 1. Limpiar y cargar datos
+cn.Execute "TRUNCATE TABLE ReporteCitas_Temp"
+
+Set cmd = New ADODB.Command
+cmd.ActiveConnection = cn
+cmd.CommandType = adCmdStoredProc
+cmd.CommandText = "usp_select_ReporteCitas_20260918"
+
+' Pasar parámetros (ejemplo)
+cmd.Parameters.Append cmd.CreateParameter("@FechaInicio", adDate, adParamInput, , CDate("2026-09-18"))
+cmd.Parameters.Append cmd.CreateParameter("@FechaFin", adDate, adParamInput, , CDate("2026-09-18"))
+cmd.Parameters.Append cmd.CreateParameter("@IdServicio", adInteger, adParamInput, , 0)
+
+' Insertar resultado en la tabla
+cn.Execute "INSERT INTO ReporteCitas_Temp EXEC usp_select_ReporteCitas_20260918 @FechaInicio, @FechaFin, @IdServicio"
+
+' 2. Leer la tabla para imprimir
+Set rs = New ADODB.Recordset
+rs.Open "SELECT * FROM ReporteCitas_Temp ORDER BY Especialidad, Servicio, HoraInicio", cn, adOpenStatic, adLockReadOnly
+
+' --- Aquí va tu lógica de impresión ---
+Do While Not rs.EOF
+    Debug.Print rs!Paciente & " - " & rs!HoraInicio & " - " & rs!EstadoCupo
+    ' O pasar el Recordset a Crystal Reports:
+    ' CrystalReport1.Database.SetDataSource rs
+    rs.MoveNext
+Loop
+
+rs.Close
+cn.Close
+

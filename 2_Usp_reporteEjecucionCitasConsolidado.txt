@@ -1,0 +1,230 @@
+
+--CREAR TABLA++++++++++++++++++
+
+
+USE [SIGH]
+GO
+
+IF OBJECT_ID('dbo.TmpReporteEjecucionCitasConsolidado', 'U') IS NOT NULL
+    DROP TABLE dbo.TmpReporteEjecucionCitasConsolidado
+GO
+
+CREATE TABLE dbo.TmpReporteEjecucionCitasConsolidado
+(
+    IdSesion            UNIQUEIDENTIFIER NOT NULL,
+    FechaCita           DATE             NOT NULL,
+    IdEspecialidad      INT              NOT NULL,
+    Especialidad        VARCHAR(200)     NULL,
+    IdMedicoProg        INT              NOT NULL,
+    MedicoProg          VARCHAR(200)     NULL,
+    HorarioAtencion     VARCHAR(11)      NULL,   -- 'HH:MM-HH:MM'
+    CuposTeoricos       INT              NOT NULL,
+    CitasAsignadas      INT              NOT NULL,
+    CitasAtendidas      INT              NOT NULL,
+    CitasNoAsistio      INT              NOT NULL,
+    CitasBloqueadas     INT              NOT NULL,
+    PorcEjecucion       DECIMAL(5,2)     NULL,
+    PorcOcupacion       DECIMAL(5,2)     NULL,
+    CONSTRAINT PK_TmpRepEjecConsolidado
+        PRIMARY KEY (IdSesion, FechaCita, IdEspecialidad, IdMedicoProg)
+)
+GO
+
+CREATE INDEX IX_TmpRepEjecConsolidado_Sesion
+    ON dbo.TmpReporteEjecucionCitasConsolidado
+       (IdSesion, FechaCita, Especialidad, MedicoProg)
+GO
+
+
+
+
+
+
+
+--USP********************
+
+
+USE [SIGH]
+GO
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+IF OBJECT_ID('dbo.usp_select_ReporteEjecucionCitasConsolidado_20261101', 'P') IS NOT NULL
+    DROP PROCEDURE dbo.usp_select_ReporteEjecucionCitasConsolidado_20261101
+GO
+
+CREATE PROCEDURE [dbo].[usp_select_ReporteEjecucionCitasConsolidado_20261101]
+(
+    @FechaInicio     DATE,
+    @FechaFin        DATE,
+    @IdServicio      INT = 0,
+    @IdEspecialidad  INT = 0,
+    @IdMedico        INT = 0,
+    @IdSesion        UNIQUEIDENTIFIER OUTPUT
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET @IdSesion = NEWID();
+
+    DELETE FROM dbo.TmpReporteEjecucionCitasConsolidado WHERE IdSesion = @IdSesion;
+
+    ;WITH Programaciones AS (
+        SELECT
+            pr.IdProgramacion,
+            pr.Fecha,
+            CONVERT(CHAR(5), CAST(pr.HoraInicio AS TIME), 108) AS HoraInicio,
+            CONVERT(CHAR(5), CAST(pr.HoraFin    AS TIME), 108) AS HoraFin,
+            pr.TiempoPromedioAtencion,
+            pr.IdServicio,
+            pr.IdEspecialidad,
+            pr.IdMedico
+        FROM ProgramacionMedica pr
+        WHERE pr.Fecha >= @FechaInicio
+          AND pr.Fecha <  DATEADD(DAY, 1, @FechaFin)
+          AND (pr.IdServicio     = @IdServicio     OR @IdServicio     = 0)
+          AND (pr.IdEspecialidad = @IdEspecialidad OR @IdEspecialidad = 0)
+          AND (pr.IdMedico       = @IdMedico       OR @IdMedico       = 0)
+          AND pr.TiempoPromedioAtencion > 0
+    ),
+    CitasUnicas AS (
+        SELECT
+            ci.IdCita, ci.IdProgramacion, ci.HoraInicio, ci.IdAtencion,
+            ROW_NUMBER() OVER (
+                PARTITION BY ci.IdProgramacion, ci.HoraInicio
+                ORDER BY ci.IdCita DESC
+            ) AS rnCita
+        FROM Citas ci
+    ),
+    CitasAtenciones AS (
+        SELECT
+            a.IdAtencion,
+            ROW_NUMBER() OVER (PARTITION BY a.IdAtencion ORDER BY a.IdAtencion DESC) AS rn
+        FROM Atenciones a
+        WHERE a.IdTipoServicio = 1
+    ),
+    AgregadoCitas AS (
+        SELECT
+            p.IdProgramacion,
+            SUM(CASE WHEN c.IdCita IS NOT NULL THEN 1 ELSE 0 END) AS CitasAsignadas,
+            SUM(CASE WHEN c.IdCita IS NOT NULL AND ca.IdAtencion IS NOT NULL THEN 1 ELSE 0 END) AS CitasAtendidas,
+            SUM(CASE WHEN c.IdCita IS NOT NULL AND ca.IdAtencion IS NULL     THEN 1 ELSE 0 END) AS CitasNoAsistio
+        FROM Programaciones p
+        LEFT JOIN CitasUnicas c
+               ON c.IdProgramacion = p.IdProgramacion
+              AND c.rnCita = 1
+        LEFT JOIN CitasAtenciones ca
+               ON ca.IdAtencion = c.IdAtencion
+              AND ca.rn = 1
+        GROUP BY p.IdProgramacion
+    ),
+    Bloqueos AS (
+        SELECT
+            cb.IdMedico,
+            cb.Fecha,
+            cb.HoraInicio,
+            COUNT(*) AS CitasBloqueadas
+        FROM CitasBloqueadas cb
+        WHERE cb.IdTipoBloqueo = 1
+          AND cb.Fecha >= @FechaInicio
+          AND cb.Fecha <  DATEADD(DAY, 1, @FechaFin)
+        GROUP BY cb.IdMedico, cb.Fecha, cb.HoraInicio
+    ),
+    -- Consolidado por Fecha + Especialidad + Médico (+ bloque si hay varios)
+    Consolidado AS (
+        SELECT
+            p.Fecha,
+            p.IdEspecialidad,
+            es.Nombre                              AS Especialidad,
+            p.IdMedico,
+            eme.ApellidoPaterno + ' ' + eme.ApellidoMaterno + ' ' + eme.Nombres AS MedicoProg,
+            MIN(p.HoraInicio)                      AS HoraInicio,
+            MAX(p.HoraFin)                         AS HoraFin,
+            SUM(CASE WHEN p.TiempoPromedioAtencion = 0 THEN 0
+                     ELSE DATEDIFF(MINUTE,
+                            CAST(p.HoraInicio AS TIME),
+                            CAST(p.HoraFin    AS TIME)) / p.TiempoPromedioAtencion
+                END)                               AS CuposTeoricos,
+            SUM(ISNULL(ac.CitasAsignadas, 0))      AS CitasAsignadas,
+            SUM(ISNULL(ac.CitasAtendidas, 0))      AS CitasAtendidas,
+            SUM(ISNULL(ac.CitasNoAsistio, 0))      AS CitasNoAsistio
+        FROM Programaciones p
+        INNER JOIN Especialidades es ON p.IdEspecialidad = es.IdEspecialidad
+        INNER JOIN Medicos me        ON p.IdMedico       = me.IdMedico
+        INNER JOIN Empleados eme     ON me.IdEmpleado    = eme.IdEmpleado
+        LEFT  JOIN AgregadoCitas ac  ON ac.IdProgramacion = p.IdProgramacion
+        GROUP BY p.Fecha, p.IdEspecialidad, es.Nombre, p.IdMedico,
+                 eme.ApellidoPaterno, eme.ApellidoMaterno, eme.Nombres
+    )
+    INSERT INTO dbo.TmpReporteEjecucionCitasConsolidado
+    (
+        IdSesion, FechaCita, IdEspecialidad, Especialidad,
+        IdMedicoProg, MedicoProg, HorarioAtencion,
+        CuposTeoricos, CitasAsignadas, CitasAtendidas, CitasNoAsistio,
+        CitasBloqueadas, PorcEjecucion, PorcOcupacion
+    )
+    SELECT
+        @IdSesion,
+        c.Fecha,
+        c.IdEspecialidad,
+        c.Especialidad,
+        c.IdMedico,
+        c.MedicoProg,
+        c.HoraInicio + '-' + c.HoraFin,
+        c.CuposTeoricos,
+        c.CitasAsignadas,
+        c.CitasAtendidas,
+        c.CitasNoAsistio,
+        ISNULL(bl.CitasBloqueadas, 0),
+        CAST(CASE WHEN c.CitasAsignadas = 0 THEN 0
+                  ELSE c.CitasAtendidas * 100.0 / c.CitasAsignadas
+             END AS DECIMAL(5,2)),
+        CAST(CASE WHEN c.CuposTeoricos  = 0 THEN 0
+                  ELSE c.CitasAsignadas * 100.0 / c.CuposTeoricos
+             END AS DECIMAL(5,2))
+    FROM Consolidado c
+    LEFT JOIN Bloqueos bl ON bl.IdMedico   = c.IdMedico
+                         AND bl.Fecha      = c.Fecha
+                         AND bl.HoraInicio = c.HoraInicio;
+
+    SELECT IdSesion = @IdSesion;
+END
+GO
+
+
+
+
+
+--EJECUTAR+++++++++++++++++
+
+USE [SIGH]
+GO
+
+DECLARE @MiSesion UNIQUEIDENTIFIER;
+
+EXEC [dbo].[usp_select_ReporteEjecucionCitasConsolidado_20261101]
+    @FechaInicio     = '2026-10-01',
+    @FechaFin        = '2026-10-31',
+    @IdServicio      = 0,
+    @IdEspecialidad  = 0,
+    @IdMedico        = 0,
+    @IdSesion        = @MiSesion OUTPUT;
+
+-- Resultado consolidado Fecha + Especialidad + Médico
+SELECT
+    FechaCita,
+    Especialidad,
+    MedicoProg          AS Medico,
+    HorarioAtencion,
+    CuposTeoricos       AS Disponibles,
+    CitasAsignadas,
+    CitasAtendidas,
+    CitasNoAsistio,
+    CitasBloqueadas,
+    PorcEjecucion       AS [% Ejecucion],
+    PorcOcupacion       AS [% Ocupacion]
+FROM dbo.TmpReporteEjecucionCitasConsolidado
+WHERE IdSesion = @MiSesion
+ORDER BY FechaCita, Especialidad, MedicoProg;
