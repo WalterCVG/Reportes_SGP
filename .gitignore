@@ -1,0 +1,14 @@
+# No subir compilados
+*.exe
+*.dll
+*.ocx
+*.log
+
+# Archivos temporales VB6
+*.obj
+*.lib
+*.exp
+*.frx.bak
+
+# Config local
+*.ini.local

@@ -15,17 +15,16 @@ CREATE TABLE dbo.TmpReporteEjecucionCitasCrystal
     IdEspecialidad    INT              NOT NULL,
     Especialidad      VARCHAR(200)     NULL,
     
-    -- NUEVOS CAMPOS
     CuposTeoricos     INT              NOT NULL DEFAULT 0, 
-    
     Citados           INT              NOT NULL,
     Atendidos         INT              NOT NULL,
     NoAtendidos       INT              NOT NULL,
     Reprogramados     INT              NOT NULL,   -- 0 por ahora
     
     -- NUEVO CAMPO
+    PorcentajeDia DECIMAL(5,2) NULL,
+
     PorcejeProg       DECIMAL(5,2)     NULL,       -- Citados / CuposTeoricos * 100
-    
     PorcAtendidos     DECIMAL(5,2)     NULL,
     PorcNoAtendidos   DECIMAL(5,2)     NULL,
     PorcReprogramados DECIMAL(5,2)     NULL,
@@ -45,16 +44,13 @@ GO
 
 USE [SIGH]
 GO
+
 SET ANSI_NULLS ON
 GO
 SET QUOTED_IDENTIFIER ON
 GO
 
-IF OBJECT_ID('dbo.usp_select_ReporteEjecucionCitasCrystal_20261101', 'P') IS NOT NULL
-    DROP PROCEDURE dbo.usp_select_ReporteEjecucionCitasCrystal_20261101
-GO
-
-CREATE PROCEDURE dbo.usp_select_ReporteEjecucionCitasCrystal_20261101
+ALTER PROCEDURE [dbo].[usp_select_ReporteEjecucionCitasCrystal_20261101]
 (
     @FechaInicio     DATE,
     @FechaFin        DATE,
@@ -70,7 +66,7 @@ BEGIN
 
     DELETE FROM dbo.TmpReporteEjecucionCitasCrystal WHERE IdSesion = @IdSesion;
 
-    -- 1) Poblar el detalle reutilizando el USP existente
+    -- Poblar el detalle base
     DECLARE @SesionDet UNIQUEIDENTIFIER;
     EXEC dbo.usp_select_ReporteEjecucionCitas_20261101
         @FechaInicio = @FechaInicio,
@@ -78,62 +74,73 @@ BEGIN
         @IdServicio  = @IdServicio,
         @IdSesion    = @SesionDet OUTPUT;
 
-    -- 2) Agregar por Fecha + Especialidad
-    ;WITH Det AS (
-        SELECT
-            d.FechaCita,
-            d.IdEspecialidad,
-            d.Especialidad,
-            d.EstadoCupo,
-            d.Atendido
-        FROM dbo.TmpReporteEjecucionCitas d
-        WHERE d.IdSesion = @SesionDet
-          AND (@IdEspecialidad = 0 OR d.IdEspecialidad = @IdEspecialidad)
-          AND (@IdMedico       = 0 OR d.IdMedicoProg   = @IdMedico)
-    )
+    -- Usamos una Tabla Temporal para que esté disponible en ambos INSERT
+    IF OBJECT_ID('tempdb..#Det') IS NOT NULL DROP TABLE #Det;
+
+    SELECT
+        d.FechaCita,
+        d.IdEspecialidad,
+        d.Especialidad,
+        d.EstadoCupo,
+        d.Atendido
+    INTO #Det
+    FROM dbo.TmpReporteEjecucionCitas d
+    WHERE d.IdSesion = @SesionDet
+      AND (@IdEspecialidad = 0 OR d.IdEspecialidad = @IdEspecialidad)
+      AND (@IdMedico       = 0 OR d.IdMedicoProg   = @IdMedico);
+
+    -- INSERT 1: Registros por Especialidad
     INSERT INTO dbo.TmpReporteEjecucionCitasCrystal
     (
         IdSesion, FechaCita, DiaSemana, IdEspecialidad, Especialidad,
-        CuposTeoricos, -- NUEVO
-        Citados, Atendidos, NoAtendidos, Reprogramados,
-        PorcejeProg,   -- NUEVO
-        PorcAtendidos, PorcNoAtendidos, PorcReprogramados
+        CuposTeoricos, Citados, Atendidos, NoAtendidos, Reprogramados,
+        PorcejeProg, PorcAtendidos, PorcNoAtendidos, PorcReprogramados, PorcentajeDia
     )
     SELECT
-        @IdSesion,
-        d.FechaCita,
-        DATENAME(WEEKDAY, d.FechaCita),
-        d.IdEspecialidad,
-        MAX(d.Especialidad),
-        
-        -- Contamos todos los registros (Cupos generados)
-        COUNT(1)                                                                     AS CuposTeoricos, 
-        
-        SUM(CASE WHEN d.EstadoCupo = 'OCUPADO' THEN 1 ELSE 0 END)                    AS Citados,
+        @IdSesion, d.FechaCita, DATENAME(WEEKDAY, d.FechaCita), d.IdEspecialidad, MAX(d.Especialidad),
+        COUNT(1) AS CuposTeoricos,
+        SUM(CASE WHEN d.EstadoCupo = 'OCUPADO' THEN 1 ELSE 0 END) AS Citados,
         SUM(CASE WHEN d.EstadoCupo = 'OCUPADO' AND d.Atendido = 1 THEN 1 ELSE 0 END) AS Atendidos,
         SUM(CASE WHEN d.EstadoCupo = 'OCUPADO' AND d.Atendido = 0 THEN 1 ELSE 0 END) AS NoAtendidos,
-        0                                                                            AS Reprogramados,
-        
-        -- CALCULO PORCEJE PROG (Citados / CuposTeoricos) * 100
-        CAST(CASE WHEN COUNT(1) = 0 THEN 0
-                  ELSE SUM(CASE WHEN d.EstadoCupo='OCUPADO' THEN 1 ELSE 0 END) * 100.0 / COUNT(1)
-             END AS DECIMAL(5,2))                                                AS PorcejeProg,
-             
-        CAST(CASE WHEN SUM(CASE WHEN d.EstadoCupo='OCUPADO' THEN 1 ELSE 0 END) = 0 THEN 0
-                  ELSE SUM(CASE WHEN d.EstadoCupo='OCUPADO' AND d.Atendido=1 THEN 1 ELSE 0 END) * 100.0
-                       / SUM(CASE WHEN d.EstadoCupo='OCUPADO' THEN 1 ELSE 0 END)
-             END AS DECIMAL(5,2))                                                AS PorcAtendidos,
-        CAST(CASE WHEN SUM(CASE WHEN d.EstadoCupo='OCUPADO' THEN 1 ELSE 0 END) = 0 THEN 0
-                  ELSE SUM(CASE WHEN d.EstadoCupo='OCUPADO' AND d.Atendido=0 THEN 1 ELSE 0 END) * 100.0
-                       / SUM(CASE WHEN d.EstadoCupo='OCUPADO' THEN 1 ELSE 0 END)
-             END AS DECIMAL(5,2))                                                AS PorcNoAtendidos,
-        0.00                                                                     AS PorcReprogramados
-    FROM Det d
+        0 AS Reprogramados,
+        CAST(CASE WHEN COUNT(1) = 0 THEN 0 ELSE SUM(CASE WHEN d.EstadoCupo='OCUPADO' THEN 1 ELSE 0 END) * 100.0 / COUNT(1) END AS DECIMAL(5,2)) AS PorcejeProg,
+        CAST(CASE WHEN SUM(CASE WHEN d.EstadoCupo='OCUPADO' THEN 1 ELSE 0 END) = 0 THEN 0 ELSE SUM(CASE WHEN d.EstadoCupo='OCUPADO' AND d.Atendido=1 THEN 1 ELSE 0 END) * 100.0 / SUM(CASE WHEN d.EstadoCupo='OCUPADO' THEN 1 ELSE 0 END) END AS DECIMAL(5,2)) AS PorcAtendidos,
+        CAST(CASE WHEN SUM(CASE WHEN d.EstadoCupo='OCUPADO' THEN 1 ELSE 0 END) = 0 THEN 0 ELSE SUM(CASE WHEN d.EstadoCupo='OCUPADO' AND d.Atendido=0 THEN 1 ELSE 0 END) * 100.0 / SUM(CASE WHEN d.EstadoCupo='OCUPADO' THEN 1 ELSE 0 END) END AS DECIMAL(5,2)) AS PorcNoAtendidos,
+        0.00 AS PorcReprogramados,
+
+        NULL As PorcentajeDia	-- <--- AQUÍ EL CAMBIO: Lo enviamos nulo para las especialidades
+    FROM #Det d
     GROUP BY d.FechaCita, d.IdEspecialidad;
+
+    -- INSERT 2: Registro TOTAL por Fecha
+    INSERT INTO dbo.TmpReporteEjecucionCitasCrystal
+    (
+        IdSesion, FechaCita, DiaSemana, IdEspecialidad, Especialidad,
+        CuposTeoricos, Citados, Atendidos, NoAtendidos, Reprogramados,
+        PorcejeProg, PorcAtendidos, PorcNoAtendidos, PorcReprogramados, PorcentajeDia
+    )
+    SELECT
+        @IdSesion, d.FechaCita, DATENAME(WEEKDAY, d.FechaCita), 9999, 'ZZ_TOTAL',
+        COUNT(1) AS CuposTeoricos,
+        SUM(CASE WHEN d.EstadoCupo = 'OCUPADO' THEN 1 ELSE 0 END) AS Citados,
+        SUM(CASE WHEN d.EstadoCupo = 'OCUPADO' AND d.Atendido = 1 THEN 1 ELSE 0 END) AS Atendidos,
+        SUM(CASE WHEN d.EstadoCupo = 'OCUPADO' AND d.Atendido = 0 THEN 1 ELSE 0 END) AS NoAtendidos,
+        0 AS Reprogramados,
+        CAST(CASE WHEN COUNT(1) = 0 THEN 0 ELSE SUM(CASE WHEN d.EstadoCupo='OCUPADO' THEN 1 ELSE 0 END) * 100.0 / COUNT(1) END AS DECIMAL(5,2)) AS PorcejeProg,
+        CAST(CASE WHEN SUM(CASE WHEN d.EstadoCupo='OCUPADO' THEN 1 ELSE 0 END) = 0 THEN 0 ELSE SUM(CASE WHEN d.EstadoCupo='OCUPADO' AND d.Atendido=1 THEN 1 ELSE 0 END) * 100.0 / SUM(CASE WHEN d.EstadoCupo='OCUPADO' THEN 1 ELSE 0 END) END AS DECIMAL(5,2)) AS PorcAtendidos,
+        CAST(CASE WHEN SUM(CASE WHEN d.EstadoCupo='OCUPADO' THEN 1 ELSE 0 END) = 0 THEN 0 ELSE SUM(CASE WHEN d.EstadoCupo='OCUPADO' AND d.Atendido=0 THEN 1 ELSE 0 END) * 100.0 / SUM(CASE WHEN d.EstadoCupo='OCUPADO' THEN 1 ELSE 0 END) END AS DECIMAL(5,2)) AS PorcNoAtendidos,
+        0.00 AS PorcReprogramados,
+        CAST(SUM(SUM(CASE WHEN d.EstadoCupo = 'OCUPADO' THEN 1 ELSE 0 END)) OVER (PARTITION BY d.FechaCita) * 100.0 / NULLIF(SUM(COUNT(1)) OVER (PARTITION BY d.FechaCita), 0) AS DECIMAL(5,2)) AS PorcentajeDia
+    FROM #Det d
+    GROUP BY d.FechaCita;
+
+    -- Eliminar tabla temporal
+    DROP TABLE #Det;
 
     SELECT IdSesion = @IdSesion;
 END
 GO
+
 
 
 --3. Ejecución y Prueba ++++++++++++++
@@ -144,27 +151,23 @@ GO
 DECLARE @MiSesion UNIQUEIDENTIFIER;
 
 EXEC dbo.usp_select_ReporteEjecucionCitasCrystal_20261101
-    @FechaInicio     = '2026-08-01',
-    @FechaFin        = '2026-08-31',
+    @FechaInicio     = '2026-10-01',
+    @FechaFin        = '2026-10-31',
     @IdServicio      = 0,
     @IdEspecialidad  = 0,
     @IdMedico        = 0,
     @IdSesion        = @MiSesion OUTPUT;
 
--- Ver los datos que insertó (incluyendo los nuevos campos)
-SELECT
-    FechaCita,
-    DiaSemana,
-    Especialidad,
-    CuposTeoricos, -- NUEVO
-    Citados,
-    PorcejeProg,   -- NUEVO
-    Atendidos,
-    NoAtendidos,
-    Reprogramados,
-    PorcAtendidos,
-    PorcNoAtendidos,
-    PorcReprogramados
+-- Ver los resultados
+SELECT 
+    FechaCita, 
+    Especialidad, 
+    CuposTeoricos, 
+    Citados, 
+    Atendidos, 
+    PorcentajeDia
 FROM dbo.TmpReporteEjecucionCitasCrystal
 WHERE IdSesion = @MiSesion
-ORDER BY FechaCita, Especialidad;
+ORDER BY FechaCita, 
+         CASE WHEN Especialidad = 'TOTAL' THEN 1 ELSE 0 END, -- Esto pone el TOTAL al final
+         Especialidad;
